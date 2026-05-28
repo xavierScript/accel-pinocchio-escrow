@@ -38,7 +38,7 @@ pub fn process_make_instruction(accounts: &mut [AccountView], data: &[u8]) -> Pr
     let bump = data[0];
     let seed = [b"escrow".as_ref(), maker.address().as_ref(), &[bump]];
 
-    let escrow_account_pda = derive_address(&seed, Some(bump), &crate::ID.to_bytes());
+    let escrow_account_pda = derive_address(&seed, None, &crate::ID.to_bytes());
     assert_eq!(escrow_account_pda, *escrow_account.address().as_array());
 
     let amount_to_receive = unsafe { *(data.as_ptr().add(1) as *const u64) };
@@ -52,7 +52,7 @@ pub fn process_make_instruction(accounts: &mut [AccountView], data: &[u8]) -> Pr
     ];
     let signer = Signer::from(&signer_seeds);
 
-    if !escrow_account.owned_by(&crate::ID) {
+    if escrow_account.owned_by(&crate::ID) {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
