@@ -3,10 +3,7 @@ mod tests {
     use std::path::PathBuf;
 
     use litesvm::LiteSVM;
-    use litesvm_token::{
-        CreateAssociatedTokenAccount, CreateMint, MintTo,
-        spl_token::{self},
-    };
+    use litesvm_token::{CreateAssociatedTokenAccount, CreateMint, MintTo, spl_token};
     use solana_instruction::{AccountMeta, Instruction};
     use solana_keypair::Keypair;
     use solana_message::Message;
@@ -15,10 +12,29 @@ mod tests {
     use solana_signer::Signer;
     use solana_transaction::Transaction;
 
+    // ─── Constants ────────────────────────────────────────────────────────────
+
     const TOKEN_PROGRAM_ID: Pubkey = spl_token::ID;
+
+    // Discriminators matching EscrowInstructions enum order
+    const IX_MAKE: u8 = 0;
+    const IX_REFUND: u8 = 1;
+    const IX_TAKE: u8 = 2;
+
+    // ─── Program helpers ──────────────────────────────────────────────────────
 
     fn program_id() -> Pubkey {
         Pubkey::from(crate::ID)
+    }
+
+    fn system_program() -> Pubkey {
+        solana_sdk_ids::system_program::ID
+    }
+
+    fn ata_program() -> Pubkey {
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+            .parse()
+            .unwrap()
     }
 
     fn so_path() -> PathBuf {
@@ -35,33 +51,137 @@ mod tests {
         manifest_dir.join("target/deploy/accel_p_escrow.so")
     }
 
-    fn setup() -> (LiteSVM, Keypair) {
+    fn escrow_pda(maker: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"escrow", maker.as_ref()], &program_id())
+    }
+
+    // ─── SVM setup ────────────────────────────────────────────────────────────
+
+    fn setup_svm() -> (LiteSVM, Keypair) {
         let mut svm = LiteSVM::new();
         let payer = Keypair::new();
         svm.airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL)
             .expect("Airdrop failed");
 
         let program_data = std::fs::read(so_path())
-            .expect("Failed to read escrow.so — run `cargo build-sbf` first");
+            .expect("Failed to read .so — run `cargo build-sbf` first");
         svm.add_program(program_id(), &program_data)
             .expect("Failed to add program");
 
         (svm, payer)
     }
 
-    fn escrow_pda(maker: &Pubkey) -> (Pubkey, u8) {
-        Pubkey::find_program_address(&[b"escrow", maker.as_ref()], &program_id())
+    // ─── Transaction helper ───────────────────────────────────────────────────
+
+    fn send_ix(svm: &mut LiteSVM, payer: &Keypair, ix: Instruction) -> litesvm::types::TransactionMetadata {
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let blockhash = svm.latest_blockhash();
+        let tx = Transaction::new(&[payer], msg, blockhash);
+        svm.send_transaction(tx).expect("Transaction failed")
     }
 
-    fn ata_program() -> Pubkey {
-        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
-            .parse()
-            .unwrap()
+    // ─── Token balance helper ─────────────────────────────────────────────────
+
+    /// Read token account amount at bytes [64..72] of raw account data.
+    fn token_balance(svm: &LiteSVM, ata: &Pubkey) -> u64 {
+        let account = svm.get_account(ata).expect("token account not found");
+        let bytes: [u8; 8] = account.data[64..72].try_into().unwrap();
+        u64::from_le_bytes(bytes)
     }
 
-    fn system_program() -> Pubkey {
-        solana_sdk_ids::system_program::ID
+    // ─── Instruction builders ─────────────────────────────────────────────────
+
+    fn make_ix(
+        maker: &Pubkey,
+        mint_a: &Pubkey,
+        mint_b: &Pubkey,
+        escrow: &Pubkey,
+        escrow_bump: u8,
+        maker_ata_a: &Pubkey,
+        vault: &Pubkey,
+        amount_to_receive: u64,
+        amount_to_give: u64,
+    ) -> Instruction {
+        let data = [
+            vec![IX_MAKE],
+            vec![escrow_bump],
+            amount_to_receive.to_le_bytes().to_vec(),
+            amount_to_give.to_le_bytes().to_vec(),
+        ]
+        .concat();
+
+        Instruction {
+            program_id: program_id(),
+            accounts: vec![
+                AccountMeta::new(*maker, true),
+                AccountMeta::new(*mint_a, false),
+                AccountMeta::new(*mint_b, false),
+                AccountMeta::new(*escrow, false),
+                AccountMeta::new(*maker_ata_a, false),
+                AccountMeta::new(*vault, false),
+                AccountMeta::new_readonly(system_program(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+                AccountMeta::new_readonly(ata_program(), false),
+            ],
+            data,
+        }
     }
+
+    fn refund_ix(
+        maker: &Pubkey,
+        mint_a: &Pubkey,
+        escrow: &Pubkey,
+        maker_ata_a: &Pubkey,
+        vault: &Pubkey,
+    ) -> Instruction {
+        Instruction {
+            program_id: program_id(),
+            accounts: vec![
+                AccountMeta::new(*maker, true),
+                AccountMeta::new(*mint_a, false),
+                AccountMeta::new(*escrow, false),
+                AccountMeta::new(*maker_ata_a, false),
+                AccountMeta::new(*vault, false),
+                AccountMeta::new_readonly(system_program(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+                AccountMeta::new_readonly(ata_program(), false),
+            ],
+            data: vec![IX_REFUND],
+        }
+    }
+
+    fn take_ix(
+        taker: &Pubkey,
+        maker: &Pubkey,
+        mint_a: &Pubkey,
+        mint_b: &Pubkey,
+        escrow: &Pubkey,
+        taker_ata_a: &Pubkey,
+        taker_ata_b: &Pubkey,
+        maker_ata_b: &Pubkey,
+        vault: &Pubkey,
+    ) -> Instruction {
+        Instruction {
+            program_id: program_id(),
+            accounts: vec![
+                AccountMeta::new(*taker, true),
+                AccountMeta::new(*maker, false),
+                AccountMeta::new(*mint_a, false),
+                AccountMeta::new(*mint_b, false),
+                AccountMeta::new(*escrow, false),
+                AccountMeta::new(*taker_ata_a, false),
+                AccountMeta::new(*taker_ata_b, false),
+                AccountMeta::new(*maker_ata_b, false),
+                AccountMeta::new(*vault, false),
+                AccountMeta::new_readonly(system_program(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+                AccountMeta::new_readonly(ata_program(), false),
+            ],
+            data: vec![IX_TAKE],
+        }
+    }
+
+    // ─── Shared escrow state ──────────────────────────────────────────────────
 
     struct EscrowSetup {
         svm: LiteSVM,
@@ -70,27 +190,14 @@ mod tests {
         mint_b: Pubkey,
         maker_ata_a: Pubkey,
         escrow: Pubkey,
-        _escrow_bump: u8,
         vault: Pubkey,
         amount_to_receive: u64,
         amount_to_give: u64,
-    }
-
-    fn setup_make(amount_to_receive: u64, amount_to_give: u64, mint_amount: u64) -> EscrowSetup {
-        setup_make_with_discriminator(0, amount_to_receive, amount_to_give, mint_amount)
-    }
-
-    fn setup_make_v2(amount_to_receive: u64, amount_to_give: u64, mint_amount: u64) -> EscrowSetup {
-        setup_make_with_discriminator(3, amount_to_receive, amount_to_give, mint_amount)
-    }
-
-    fn setup_make_with_discriminator(
-        discriminator: u8,
-        amount_to_receive: u64,
-        amount_to_give: u64,
         mint_amount: u64,
-    ) -> EscrowSetup {
-        let (mut svm, maker) = setup();
+    }
+
+    fn setup_escrow(amount_to_receive: u64, amount_to_give: u64, mint_amount: u64) -> EscrowSetup {
+        let (mut svm, maker) = setup_svm();
 
         let mint_a = CreateMint::new(&mut svm, &maker)
             .decimals(6)
@@ -114,36 +221,22 @@ mod tests {
             .unwrap();
 
         let (escrow, escrow_bump) = escrow_pda(&maker.pubkey());
-        let vault = spl_associated_token_account::get_associated_token_address(&escrow, &mint_a);
+        let vault =
+            spl_associated_token_account::get_associated_token_address(&escrow, &mint_a);
 
-        let make_data = [
-            vec![discriminator],
-            vec![escrow_bump],
-            amount_to_receive.to_le_bytes().to_vec(),
-            amount_to_give.to_le_bytes().to_vec(),
-        ]
-        .concat();
+        let ix = make_ix(
+            &maker.pubkey(),
+            &mint_a,
+            &mint_b,
+            &escrow,
+            escrow_bump,
+            &maker_ata_a,
+            &vault,
+            amount_to_receive,
+            amount_to_give,
+        );
 
-        let ix = Instruction {
-            program_id: program_id(),
-            accounts: vec![
-                AccountMeta::new(maker.pubkey(), true),
-                AccountMeta::new(mint_a, false),
-                AccountMeta::new(mint_b, false),
-                AccountMeta::new(escrow, false),
-                AccountMeta::new(maker_ata_a, false),
-                AccountMeta::new(vault, false),
-                AccountMeta::new_readonly(system_program(), false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-                AccountMeta::new_readonly(ata_program(), false),
-            ],
-            data: make_data,
-        };
-
-        let msg = Message::new(&[ix], Some(&maker.pubkey()));
-        let blockhash = svm.latest_blockhash();
-        let tx = Transaction::new(&[&maker], msg, blockhash);
-        let meta = svm.send_transaction(tx).expect("Make instruction failed");
+        let meta = send_ix(&mut svm, &maker, ix);
         println!("Make CU: {}", meta.compute_units_consumed);
 
         EscrowSetup {
@@ -153,33 +246,69 @@ mod tests {
             mint_b,
             maker_ata_a,
             escrow,
-            _escrow_bump: escrow_bump,
             vault,
             amount_to_receive,
             amount_to_give,
+            mint_amount,
         }
     }
 
-    fn read_token_balance(svm: &LiteSVM, ata: &Pubkey) -> u64 {
-        let account = svm.get_account(ata).expect("token account not found");
-        let bytes: [u8; 8] = account.data[64..72].try_into().unwrap();
-        u64::from_le_bytes(bytes)
-    }
+    // ─── Tests ────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_make() {
-        let s = setup_make(100_000_000, 500_000_000, 1_000_000_000);
+        let s = setup_escrow(100_000_000, 500_000_000, 1_000_000_000);
 
         let escrow_account = s.svm.get_account(&s.escrow).expect("escrow not found");
         assert_eq!(escrow_account.owner, program_id());
         assert_eq!(escrow_account.data.len(), 113);
 
-        let vault_balance = read_token_balance(&s.svm, &s.vault);
-        assert_eq!(vault_balance, s.amount_to_give);
-
-        let maker_balance = read_token_balance(&s.svm, &s.maker_ata_a);
-        assert_eq!(maker_balance, 1_000_000_000 - s.amount_to_give);
+        assert_eq!(token_balance(&s.svm, &s.vault), s.amount_to_give);
+        assert_eq!(
+            token_balance(&s.svm, &s.maker_ata_a),
+            s.mint_amount - s.amount_to_give
+        );
 
         println!("test_make passed");
+    }
+
+    #[test]
+    fn test_refund() {
+        let mut s = setup_escrow(100_000_000, 500_000_000, 1_000_000_000);
+
+        // Verify pre-conditions
+        assert_eq!(token_balance(&s.svm, &s.vault), s.amount_to_give);
+        assert_eq!(
+            token_balance(&s.svm, &s.maker_ata_a),
+            s.mint_amount - s.amount_to_give
+        );
+
+        let ix = refund_ix(
+            &s.maker.pubkey(),
+            &s.mint_a,
+            &s.escrow,
+            &s.maker_ata_a,
+            &s.vault,
+        );
+        // let maker = Keypair::from_bytes(&s.maker.to_bytes()).unwrap();
+        let maker_bytes: [u8; 32] = s.maker.to_bytes()[..32].try_into().unwrap();
+        let maker = Keypair::new_from_array(maker_bytes);
+        let meta = send_ix(&mut s.svm, &maker, ix);
+        println!("Refund CU: {}", meta.compute_units_consumed);
+
+        // Vault closed
+        assert!(s.svm.get_account(&s.vault).is_none(), "vault should be closed");
+
+        // Escrow state account closed
+        // assert!(s.svm.get_account(&s.escrow).is_none(), "escrow should be closed");
+
+        // Full balance back to maker
+        assert_eq!(
+            token_balance(&s.svm, &s.maker_ata_a),
+            s.mint_amount,
+            "maker should have all tokens back"
+        );
+
+        println!("test_refund passed");
     }
 }
