@@ -158,9 +158,9 @@ use crate::instructions::take;
         mint_a: &Pubkey,
         mint_b: &Pubkey,
         escrow: &Pubkey,
+        maker_ata_b: &Pubkey,
         taker_ata_a: &Pubkey,
         taker_ata_b: &Pubkey,
-        maker_ata_b: &Pubkey,
         vault: &Pubkey,
     ) -> Instruction {
         Instruction {
@@ -171,8 +171,8 @@ use crate::instructions::take;
                 AccountMeta::new(*mint_a, false),
                 AccountMeta::new(*mint_b, false),
                 AccountMeta::new(*escrow, false),
-                AccountMeta::new(*taker_ata_a, false),
                 AccountMeta::new(*maker_ata_b, false),
+                AccountMeta::new(*taker_ata_a, false),
                 AccountMeta::new(*taker_ata_b, false),
                 AccountMeta::new(*vault, false),
                 AccountMeta::new_readonly(system_program(), false),
