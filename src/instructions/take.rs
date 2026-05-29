@@ -64,7 +64,7 @@ pub fn process_take_instruction(accounts: &mut [AccountView], data: &[u8]) -> Pr
     ];
     // let signer = Signer::from(&signer_seeds);
 
-    if escrow_account.owned_by(&crate::ID) {
+    if !escrow_account.owned_by(&crate::ID) {
         return Err(ProgramError::IllegalOwner);
     }
 

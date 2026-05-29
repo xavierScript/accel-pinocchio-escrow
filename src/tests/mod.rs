@@ -12,7 +12,9 @@ mod tests {
     use solana_signer::Signer;
     use solana_transaction::Transaction;
 
-    // ─── Constants ────────────────────────────────────────────────────────────
+use crate::instructions::take;
+
+    // ─── Constants
 
     const TOKEN_PROGRAM_ID: Pubkey = spl_token::ID;
 
@@ -21,7 +23,7 @@ mod tests {
     const IX_REFUND: u8 = 1;
     const IX_TAKE: u8 = 2;
 
-    // ─── Program helpers ──────────────────────────────────────────────────────
+    // ─── Program helpers
 
     fn program_id() -> Pubkey {
         Pubkey::from(crate::ID)
@@ -55,7 +57,7 @@ mod tests {
         Pubkey::find_program_address(&[b"escrow", maker.as_ref()], &program_id())
     }
 
-    // ─── SVM setup ────────────────────────────────────────────────────────────
+    // ─── SVM setup
 
     fn setup_svm() -> (LiteSVM, Keypair) {
         let mut svm = LiteSVM::new();
@@ -71,16 +73,16 @@ mod tests {
         (svm, payer)
     }
 
-    // ─── Transaction helper ───────────────────────────────────────────────────
+    // ─── Transaction helper
 
-    fn send_ix(svm: &mut LiteSVM, payer: &Keypair, ix: Instruction) -> litesvm::types::TransactionMetadata {
+    fn send_ix(svm: &mut LiteSVM, payer: &Keypair, signers: &[&Keypair], ix: Instruction) -> litesvm::types::TransactionMetadata {
         let msg = Message::new(&[ix], Some(&payer.pubkey()));
         let blockhash = svm.latest_blockhash();
-        let tx = Transaction::new(&[payer], msg, blockhash);
+        let tx = Transaction::new(signers, msg, blockhash);
         svm.send_transaction(tx).expect("Transaction failed")
     }
 
-    // ─── Token balance helper ─────────────────────────────────────────────────
+    // ─── Token balance helper
 
     /// Read token account amount at bytes [64..72] of raw account data.
     fn token_balance(svm: &LiteSVM, ata: &Pubkey) -> u64 {
@@ -89,7 +91,7 @@ mod tests {
         u64::from_le_bytes(bytes)
     }
 
-    // ─── Instruction builders ─────────────────────────────────────────────────
+    // ─── Instruction builders
 
     fn make_ix(
         maker: &Pubkey,
@@ -151,8 +153,8 @@ mod tests {
     }
 
     fn take_ix(
-        taker: &Pubkey,
         maker: &Pubkey,
+        taker: &Pubkey,
         mint_a: &Pubkey,
         mint_b: &Pubkey,
         escrow: &Pubkey,
@@ -164,14 +166,14 @@ mod tests {
         Instruction {
             program_id: program_id(),
             accounts: vec![
-                AccountMeta::new(*taker, true),
                 AccountMeta::new(*maker, false),
+                AccountMeta::new(*taker, true),
                 AccountMeta::new(*mint_a, false),
                 AccountMeta::new(*mint_b, false),
                 AccountMeta::new(*escrow, false),
                 AccountMeta::new(*taker_ata_a, false),
-                AccountMeta::new(*taker_ata_b, false),
                 AccountMeta::new(*maker_ata_b, false),
+                AccountMeta::new(*taker_ata_b, false),
                 AccountMeta::new(*vault, false),
                 AccountMeta::new_readonly(system_program(), false),
                 AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
@@ -181,7 +183,7 @@ mod tests {
         }
     }
 
-    // ─── Shared escrow state ──────────────────────────────────────────────────
+    // ─── Shared escrow state
 
     struct EscrowSetup {
         svm: LiteSVM,
@@ -236,7 +238,7 @@ mod tests {
             amount_to_give,
         );
 
-        let meta = send_ix(&mut svm, &maker, ix);
+        let meta = send_ix(&mut svm, &maker, &[&maker], ix);
         println!("Make CU: {}", meta.compute_units_consumed);
 
         EscrowSetup {
@@ -253,7 +255,7 @@ mod tests {
         }
     }
 
-    // ─── Tests ────────────────────────────────────────────────────────────────
+    // ─── Tests
 
     #[test]
     fn test_make() {
@@ -290,10 +292,11 @@ mod tests {
             &s.maker_ata_a,
             &s.vault,
         );
+
         // let maker = Keypair::from_bytes(&s.maker.to_bytes()).unwrap();
         let maker_bytes: [u8; 32] = s.maker.to_bytes()[..32].try_into().unwrap();
         let maker = Keypair::new_from_array(maker_bytes);
-        let meta = send_ix(&mut s.svm, &maker, ix);
+        let meta = send_ix(&mut s.svm, &maker, &[&maker], ix);
         println!("Refund CU: {}", meta.compute_units_consumed);
 
         // Vault closed
@@ -310,5 +313,82 @@ mod tests {
         );
 
         println!("test_refund passed");
+    }
+
+    #[test]
+    fn test_take() {
+        let mut s = setup_escrow(100_000_000, 500_000_000, 1_000_000_000);
+
+        // Set up taker with mint_b tokens to pay the maker
+        let taker = Keypair::new();
+        s.svm
+            .airdrop(&taker.pubkey(), 10 * LAMPORTS_PER_SOL)
+            .expect("Airdrop failed");
+
+        let taker_ata_b = CreateAssociatedTokenAccount::new(&mut s.svm, &taker, &s.mint_b)
+            .owner(&taker.pubkey())
+            .send()
+            .unwrap();
+
+        MintTo::new(&mut s.svm, &s.maker, &s.mint_b, &taker_ata_b, s.amount_to_receive)
+            .send()
+            .unwrap();
+
+        let taker_ata_a = CreateAssociatedTokenAccount::new(&mut s.svm, &taker, &s.mint_a)
+            .owner(&taker.pubkey())
+            .send()
+            .unwrap();
+
+        let maker_ata_b = CreateAssociatedTokenAccount::new(&mut s.svm, &s.maker, &s.mint_b)
+            .owner(&s.maker.pubkey())
+            .send()
+            .unwrap();
+   
+        // Verify pre-conditions
+        assert_eq!(token_balance(&s.svm, &s.vault), s.amount_to_give);
+        assert_eq!(token_balance(&s.svm, &taker_ata_b), s.amount_to_receive);
+        assert_eq!(token_balance(&s.svm, &taker_ata_a), 0);
+        assert_eq!(token_balance(&s.svm, &maker_ata_b), 0);
+
+        let ix = take_ix(
+            &s.maker.pubkey(),
+            &taker.pubkey(),
+            &s.mint_a,
+            &s.mint_b,
+            &s.escrow,
+            &maker_ata_b,
+            &taker_ata_a,
+            &taker_ata_b,
+            &s.vault,
+        );
+
+        let meta = send_ix(&mut s.svm, &taker, &[&taker], ix);
+        println!("Take CU: {}", meta.compute_units_consumed);
+
+        // Taker received mint_a from vault
+        assert_eq!(
+            token_balance(&s.svm, &taker_ata_a),
+            s.amount_to_give,
+            "taker should receive escrowed tokens"
+        );
+
+        // Maker received mint_b from taker
+        assert_eq!(
+            token_balance(&s.svm, &maker_ata_b),
+            s.amount_to_receive,
+            "maker should receive payment tokens"
+        );
+
+        // Taker's payment tokens debited
+        assert_eq!(
+            token_balance(&s.svm, &taker_ata_b),
+            0,
+            "taker's payment tokens should be debited"
+        );
+
+        // Vault closed
+        assert!(s.svm.get_account(&s.vault).is_none(), "vault should be closed");
+
+        println!("test_take passed");
     }
 }
